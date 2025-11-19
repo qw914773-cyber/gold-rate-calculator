@@ -1,198 +1,217 @@
-# streamlit_app.py
-# Streamlit Gold Rate Calculator — server-side fetch from Investing.com
-# Run locally: streamlit run streamlit_app.py
-
+# app.py
 import streamlit as st
 import requests
-import re
-import time
 from datetime import datetime
-from typing import Optional
+from math import isfinite
 
-st.set_page_config(page_title="Gold Rate Calculator (INR)", layout="centered")
+GRAMS_PER_TROY_OUNCE = 31.1034768
 
-HEADERS = {
-    "User-Agent": "goldcalc/1.0 (+https://example.com)"
-}
-DEFAULT_XAU = "https://in.investing.com/currencies/xau-usd"
-DEFAULT_USD = "https://in.investing.com/currencies/usd-inr"
-OUNCE_TO_GRAM = 31.1034768
+st.set_page_config(page_title="Gold Rate Calculator — Live", layout="centered")
 
-st.title("Gold Rate Calculator — Live (server-side)")
+st.title("Gold Rate Calculator — Live (server side)")
+st.write("Fetches XAU (USD/oz) and converts to INR per 10g. Tries Investing.com API first, falls back to Yahoo Finance.")
 
-st.markdown(
-    "This app scrapes **Investing.com** server-side and converts XAU/USD → INR → per 10g, "
-    "applies import duty + GST and shows 24K, 22K and 18K rates. Use the controls below to adjust taxes or MCX rounding."
-)
-
-with st.sidebar:
-    st.header("Settings")
-    xau_url = st.text_input("XAU/USD URL", DEFAULT_XAU)
-    usd_url = st.text_input("USD/INR URL", DEFAULT_USD)
-    import_duty = st.number_input("Import duty (%)", value=6.0, step=0.1, format="%.2f")
-    gst_pct = st.number_input("GST / IGST (%)", value=3.0, step=0.1, format="%.2f")
-    mcx_adjust = st.number_input("MCX adjustment (₹ per 10g)", value=0.0, step=0.1, format="%.2f")
-    cache_seconds = st.number_input("Cache duration (s)", value=30, min_value=5, step=5)
-    auto_refresh = st.checkbox("Auto-refresh", value=False)
-    refresh_interval = st.number_input("Auto-refresh interval (s)", value=15, min_value=5, step=1)
-
-st.write("**Manual controls:**")
-col1, col2 = st.columns([1,1])
+# Controls
+col1, col2 = st.columns([1, 1])
 with col1:
-    if st.button("Fetch now"):
-        st.session_state["_force_fetch"] = True
+    fetch_now = st.button("Fetch now")
 with col2:
-    if st.button("Clear cache"):
-        st.session_state["_clear_cache"] = True
+    clear_cache = st.button("Clear cache")
 
-# --- Helpers ---
+# User inputs for taxes and rounding (change them to match MCX)
+st.sidebar.header("Tax & rounding settings")
+import_duty_pct = st.sidebar.number_input("Import duty (%)", value=10.0, min_value=0.0, step=0.1)
+gst_pct = st.sidebar.number_input("GST (%)", value=3.0, min_value=0.0, step=0.1)
+round_to = st.sidebar.number_input("Round to (₹)", value=0.1, step=0.1)
 
-def extract_price(html: str) -> Optional[float]:
-    """Heuristic HTML extraction for Investing.com price"""
-    if not html:
-        return None
-    # 1) data-last="1234.56"
-    m = re.search(r'data-last=["\']?([0-9,]+\.\d+)["\']?', html)
-    if m:
-        return float(m.group(1).replace(",", ""))
-    # 2) id="last_last">1234.56<
-    m = re.search(r'id=["\']last_last["\'][^>]*>([0-9,]+\.\d+)<', html)
-    if m:
-        return float(m.group(1).replace(",", ""))
-    # 3) 'instrument-price-last' vicinity
-    idx = html.find("instrument-price-last")
-    if idx != -1:
-        snippet = html[idx: idx + 400]
-        m = re.search(r'([0-9]{1,3}(?:,[0-9]{3})*\.\d+)', snippet)
-        if m:
-            return float(m.group(1).replace(",", ""))
-    # 4) fallback: first numeric token like 1,234.56
-    m = re.search(r'([0-9]{1,3}(?:,[0-9]{3})*\.\d{1,6})', html)
-    if m:
-        return float(m.group(1).replace(",", ""))
-    return None
+# simple server-side cache using st.session_state
+if "cached" not in st.session_state:
+    st.session_state.cached = {}
 
-@st.cache_data(ttl=30)
-def fetch_page(url: str) -> str:
-    r = requests.get(url, headers=HEADERS, timeout=15)
-    r.raise_for_status()
-    return r.text
+def clear_cache_fn():
+    st.session_state.cached = {}
+    st.success("Cache cleared.")
 
-def compute_rates(xau_usd: float, usd_inr: float, import_duty_pct: float, gst_pct: float, mcx_adj: float):
-    price_per_gram_usd = xau_usd / OUNCE_TO_GRAM
-    price_per_gram_inr = price_per_gram_usd * usd_inr
-    per_10g = price_per_gram_inr * 10.0
-
-    customs = per_10g * (import_duty_pct / 100.0)
-    assessable = per_10g + customs
-    gst_amount = assessable * (gst_pct / 100.0)
-    imported_24 = per_10g + customs + gst_amount
-
-    raw24 = per_10g
-    raw22 = raw24 * (22.0 / 24.0)
-    raw18 = raw24 * (18.0 / 24.0)
-
-    imported22 = imported_24 * (22.0 / 24.0)
-    imported18 = imported_24 * (18.0 / 24.0)
-
-    mcx24 = imported_24 + mcx_adj
-    mcx22 = imported22 + mcx_adj
-    mcx18 = imported18 + mcx_adj
-
-    return {
-        "source": {"xau_usd": xau_usd, "usd_inr": usd_inr},
-        "raw": {"24k": raw24, "22k": raw22, "18k": raw18},
-        "imported": {"24k": imported_24, "22k": imported22, "18k": imported18},
-        "mcx": {"24k": mcx24, "22k": mcx22, "18k": mcx18},
-    }
-
-# --- Fetching logic with cache/clear support ---
-force = st.session_state.get("_force_fetch", False)
-clear_cache = st.session_state.pop("_clear_cache", False) if st.session_state.get("_clear_cache") else False
 if clear_cache:
-    # clear cache by calling st.cache_data.clear()
+    clear_cache_fn()
+
+def fetch_investing_xau():
+    """Try Investing.com hidden-ish API endpoint for XAU/USD; may return 403."""
+    url = "https://api.investing.com/api/financialdata/v1/indices/XAU_USD/historical/chart"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://in.investing.com",
+    }
     try:
-        st.cache_data.clear()
-        st.success("Cache cleared.")
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        # try a few common shapes for the price
+        # 1) direct last field
+        if isinstance(data, dict):
+            if "last" in data:
+                return float(data["last"]), "Investing.com API"
+            # maybe series of points
+            if "series" in data and isinstance(data["series"], list) and len(data["series"])>0:
+                # take last point value if available
+                last_point = data["series"][-1]
+                if isinstance(last_point, dict) and "value" in last_point:
+                    return float(last_point["value"]), "Investing.com API"
+            # other possibilities: data.get("data")[...]
+            if "data" in data and isinstance(data["data"], list) and len(data["data"])>0:
+                # pick last element if it's a number or dict
+                last = data["data"][-1]
+                if isinstance(last, (int, float)):
+                    return float(last), "Investing.com API"
+                if isinstance(last, dict) and "close" in last:
+                    return float(last["close"]), "Investing.com API"
+        # fallback: try to parse 'price' key
+        if isinstance(data, dict) and "price" in data:
+            return float(data["price"]), "Investing.com API"
+    except requests.exceptions.HTTPError as e:
+        # will be caught by caller
+        raise
     except Exception:
-        st.warning("Cache clear attempted; if you see stale data, refresh the page.")
+        pass
+    raise RuntimeError("Investing.com endpoint didn't return price in expected format.")
 
-# Adjust fetch ttl based on user input (re-decorated cache isn't dynamic; we will re-call fetch_page with a custom wrapper)
-# To honor user cache_seconds we will bypass cache if force or if cache_seconds small.
-def safe_fetch(url: str, bypass: bool = False):
-    # if bypass, call requests directly
-    if bypass:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        return r.text
-    # else use cached function (ttl defined by decorator default)
-    return fetch_page(url)
+def fetch_yahoo_xau():
+    """Fallback: Yahoo Finance quote endpoint for XAUUSD=X"""
+    url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=XAUUSD=X"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        j = resp.json()
+        q = j.get("quoteResponse", {}).get("result", [])
+        if q and isinstance(q, list):
+            price = q[0].get("regularMarketPrice") or q[0].get("bid") or q[0].get("ask")
+            if price is not None:
+                return float(price), "Yahoo Finance"
+    except Exception:
+        pass
+    raise RuntimeError("Yahoo Finance fallback failed.")
 
-# Determine when to bypass cache:
-bypass_cache = force or cache_seconds <= 0 or st.session_state.get("_force_fetch", False)
-# reset force flag
-if "_force_fetch" in st.session_state:
-    st.session_state["_force_fetch"] = False
+def fetch_usd_inr():
+    """Get USD to INR rate using exchangerate.host (free)"""
+    url = "https://api.exchangerate.host/latest"
+    params = {"base": "USD", "symbols": "INR"}
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        j = resp.json()
+        rate = j.get("rates", {}).get("INR")
+        if rate:
+            return float(rate)
+    except Exception:
+        pass
+    # last ditch: approximate using a fixed value (only if absolutely necessary).
+    raise RuntimeError("Failed to fetch USD→INR from exchangerate.host. Check network.")
 
-# perform fetch
-status = st.empty()
-try:
-    status.info("Fetching prices from Investing.com ...")
-    xau_html = safe_fetch(xau_url, bypass=bypass_cache)
-    usd_html = safe_fetch(usd_url, bypass=bypass_cache)
-    xau = extract_price(xau_html)
-    usd = extract_price(usd_html)
-    if xau is None or usd is None:
-        raise ValueError("Failed to parse source pages. Investing.com markup may have changed or site blocked requests.")
-    rates = compute_rates(xau, usd, import_duty, gst_pct, mcx_adjust)
-    status.success(f"Fetched at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
-except Exception as e:
-    status.error(f"Error: {e}")
-    st.stop()
+def convert_and_display(xau_usd, usd_inr):
+    # xau_usd is USD per troy ounce
+    usd_per_gram = xau_usd / GRAMS_PER_TROY_OUNCE
+    usd_per_10g = usd_per_gram * 10
+    inr_per_10g = usd_per_10g * usd_inr
 
-# --- Display results ---
-st.subheader("Source prices")
-st.write(f"XAU/USD (USD/oz): **{rates['source']['xau_usd']:.6f}**")
-st.write(f"USD/INR         : **{rates['source']['usd_inr']:.6f}**")
+    rates = {}
+    rates["24K (pure) per 10g"] = inr_per_10g
+    rates["22K per 10g (22/24)"] = inr_per_10g * (22/24)
+    rates["18K per 10g (18/24)"] = inr_per_10g * (18/24)
 
-st.subheader("Raw (no tax) per 10g")
-st.table({
-    "Purity": ["24K", "22K", "18K"],
-    "Price (₹ / 10g)": [
-        f"{rates['raw']['24k']:.2f}",
-        f"{rates['raw']['22k']:.2f}",
-        f"{rates['raw']['18k']:.2f}",
-    ]
-})
+    taxed = {}
+    for k, v in rates.items():
+        after_import = v * (1 + import_duty_pct/100.0)
+        after_gst = after_import * (1 + gst_pct/100.0)
+        taxed[k] = {"pre_tax": v, "after_import": after_import, "after_gst": after_gst}
 
-st.subheader("After Import Duty + GST (per 10g)")
-st.table({
-    "Purity": ["24K", "22K", "18K"],
-    "Price (₹ / 10g)": [
-        f"{rates['imported']['24k']:.2f}",
-        f"{rates['imported']['22k']:.2f}",
-        f"{rates['imported']['18k']:.2f}",
-    ]
-})
+    # rounding helper
+    def r(x):
+        if not isfinite(x):
+            return x
+        if round_to <= 0:
+            return x
+        return round(round(x/round_to)*round_to, 2)
 
-st.subheader("MCX-adjusted (manual adjust applied)")
-st.table({
-    "Purity": ["24K", "22K", "18K"],
-    "Price (₹ / 10g)": [
-        f"{rates['mcx']['24k']:.2f}",
-        f"{rates['mcx']['22k']:.2f}",
-        f"{rates['mcx']['18k']:.2f}",
-    ]
-})
+    st.subheader("Computed rates (per 10 g)")
+    for k, v in taxed.items():
+        st.write(f"**{k}**")
+        st.write(f"- Pre-tax : ₹ {r(v['pre_tax']):,}")
+        st.write(f"- After import duty ({import_duty_pct}%) : ₹ {r(v['after_import']):,}")
+        st.write(f"- After GST ({gst_pct}%) : ₹ {r(v['after_gst']):,}")
+        st.write("")
 
-st.markdown("---")
-st.markdown(
-    "Notes:\n"
-    "- 1 troy ounce = 31.1034768 g. Purity scaling: 22K = 22/24 of 24K; 18K = 18/24 of 24K.\n"
-    "- GST is applied on (price + customs) as used in the calculation.\n"
-    "- If the app fails to parse prices, Investing.com may have changed page markup or may be blocking requests. "
-    "Try increasing cache time, or use a different source/proxy."
-)
+def main():
+    show_section = st.empty()
+    if not fetch_now and st.session_state.cached.get("last_fetched") is None:
+        st.info("Press *Fetch now* to retrieve live XAU/USD and compute rates.")
+        return
 
-if auto_refresh:
-    st.experimental_rerun()
+    # if cached and not forcing fetch, use cache
+    if not fetch_now and st.session_state.cached.get("last_fetched"):
+        cached = st.session_state.cached
+        st.success("Used cached rates (press Fetch now to refresh).")
+        st.write(f"Source: **{cached.get('source')}**")
+        st.write(f"XAU (USD/oz): {cached.get('xau_usd')}")
+        st.write(f"USD→INR: {cached.get('usd_inr')}")
+        st.write(f"Last update: {cached.get('last_fetched')}")
+        convert_and_display(cached.get('xau_usd'), cached.get('usd_inr'))
+        return
+
+    # Fresh fetch
+    error_msgs = []
+    xau_usd = None
+    source = None
+    try:
+        try:
+            xau_usd, source = fetch_investing_xau()
+        except requests.exceptions.HTTPError as he:
+            # likely 403
+            error_msgs.append(f"Investing.com HTTP error: {he}")
+            raise
+        except Exception as e:
+            error_msgs.append(f"Investing.com fetch failed: {e}")
+
+        if xau_usd is None:
+            # try fallback
+            try:
+                xau_usd, source = fetch_yahoo_xau()
+            except Exception as e:
+                error_msgs.append(f"Yahoo fallback failed: {e}")
+                raise RuntimeError("All price fetch attempts failed.")
+
+        usd_inr = fetch_usd_inr()
+
+        # cache it
+        st.session_state.cached = {
+            "xau_usd": xau_usd,
+            "usd_inr": usd_inr,
+            "source": source,
+            "last_fetched": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        }
+
+        st.success("Fetched live prices.")
+        st.write(f"Source: **{source}**")
+        st.write(f"XAU (USD per troy oz): {xau_usd}")
+        st.write(f"USD → INR : {usd_inr}")
+        st.write(f"Last update: {st.session_state.cached['last_fetched']}")
+
+        convert_and_display(xau_usd, usd_inr)
+
+    except requests.exceptions.HTTPError as he:
+        st.error(f"HTTP error while fetching Investing.com: {he}")
+        st.error("Investing.com likely returned 403 Forbidden. Try the fallback data source or use a different method (Selenium / proxy / official API key).")
+        if error_msgs:
+            st.write("Details:")
+            for e in error_msgs:
+                st.write("-", e)
+    except Exception as e:
+        st.error(f"Error: {e}")
+        if error_msgs:
+            st.write("Details:")
+            for em in error_msgs:
+                st.write("-", em)
+
+if __name__ == "__main__":
+    main()
