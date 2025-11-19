@@ -1,203 +1,226 @@
-# app.py (replace existing fetch logic with this file if you want a full working example)
+# app.py
 import streamlit as st
-import requests
+import requests, time
 from datetime import datetime, timedelta
 from math import isfinite
-import time
 
 GRAMS_PER_TROY_OUNCE = 31.1034768
 
-st.set_page_config(page_title="Gold Rate Calculator — Live", layout="centered")
-st.title("Gold Rate Calculator — Live (Yahoo w/ caching, retry, fallback)")
+st.set_page_config(page_title="Gold Rate Calculator — Live (robust)", layout="centered")
+st.title("Gold Rate Calculator — Live (robust)")
 
-# Sidebar: tax, rounding and advanced
-st.sidebar.header("Settings")
+# Sidebar settings
+st.sidebar.header("Settings & fallback")
 import_duty_pct = st.sidebar.number_input("Import Duty (%)", value=10.75, step=0.1)
 gst_pct = st.sidebar.number_input("GST (%)", value=3.0, step=0.1)
 round_to = st.sidebar.number_input("Round to (₹)", value=1.0, step=0.1)
 cache_ttl_seconds = st.sidebar.number_input("Cache TTL (sec)", value=120, min_value=10, step=10)
+ui_cooldown = st.sidebar.number_input("UI cooldown (sec)", value=10, min_value=1, step=1)
 metals_api_key = st.sidebar.text_input("Metals-API key (optional fallback)")
 
-# Button and cooldown display
-fetch_btn = st.button("Fetch Live Rate")
+# Buttons
+refresh = st.button("Refresh / Force fetch (respects cooldown)")
 
-if "last_fetch_time" not in st.session_state:
-    st.session_state.last_fetch_time = None
-if "cooldown_seconds" not in st.session_state:
-    st.session_state.cooldown_seconds = 5  # UI-level quick protection
+# session defaults
+if "cache" not in st.session_state:
+    st.session_state.cache = {}  # keys: xau_usd, usd_inr, fetched_at, source_xau, source_fx
+if "last_user_fetch" not in st.session_state:
+    st.session_state.last_user_fetch = None
+if "last_retry_after" not in st.session_state:
+    st.session_state.last_retry_after = None
 
-def can_fetch():
-    """Return (allowed: bool, wait_seconds: int)."""
-    if st.session_state.last_fetch_time is None:
-        return True, 0
-    elapsed = (datetime.utcnow() - st.session_state.last_fetch_time).total_seconds()
-    if elapsed >= st.session_state.cooldown_seconds:
-        return True, 0
-    return False, int(st.session_state.cooldown_seconds - elapsed)
+# helpers
+def cache_set(xau_usd=None, usd_inr=None, source_xau=None, source_fx=None):
+    now = datetime.utcnow()
+    st.session_state.cache.update({
+        "xau_usd": xau_usd,
+        "usd_inr": usd_inr,
+        "fetched_at": now,
+        "source_xau": source_xau,
+        "source_fx": source_fx
+    })
 
-# Simple caching (in-memory)
-if "cached_prices" not in st.session_state:
-    st.session_state.cached_prices = {}
-
-def cache_set(key, value):
-    st.session_state.cached_prices[key] = {"value": value, "fetched_at": datetime.utcnow()}
-
-def cache_get(key):
-    rec = st.session_state.cached_prices.get(key)
-    if not rec:
+def cache_get():
+    c = st.session_state.cache
+    if not c or "fetched_at" not in c:
         return None
-    age = (datetime.utcnow() - rec["fetched_at"]).total_seconds()
+    age = (datetime.utcnow() - c["fetched_at"]).total_seconds()
     if age > cache_ttl_seconds:
-        # expired
-        st.session_state.cached_prices.pop(key, None)
         return None
-    return rec["value"]
+    return c
 
-# Helper for rounding
+def cache_age_seconds():
+    c = st.session_state.cache
+    if not c or "fetched_at" not in c:
+        return None
+    return (datetime.utcnow() - c["fetched_at"]).total_seconds()
+
 def round_value(x):
     if round_to <= 0:
         return round(x, 2)
     return round(round(x / round_to) * round_to, 2)
 
-# Fetch with retries + backoff + 429 handling
-def http_get_with_retries(url, params=None, headers=None, max_attempts=3):
-    attempt = 0
+# http helper with limited retries and 429 handling (does not block UI)
+def http_get(url, params=None, headers=None, attempts=3):
     backoff = 1.0
-    while attempt < max_attempts:
-        attempt += 1
+    last_retry_after = None
+    for attempt in range(1, attempts+1):
         try:
-            resp = requests.get(url, params=params, headers=headers, timeout=10)
+            resp = requests.get(url, params=params, headers=headers, timeout=8)
             if resp.status_code == 429:
-                # Respect Retry-After header if present
-                retry_after = resp.headers.get("Retry-After")
-                if retry_after:
-                    try:
-                        wait = int(retry_after)
-                    except ValueError:
-                        # Could be a date string; fallback to small wait
-                        wait = backoff
-                else:
-                    wait = backoff
-                # Inform the caller via exception, include wait seconds
-                raise RuntimeError(f"429: Retry after {wait} seconds")
+                # read Retry-After if present
+                ra = resp.headers.get("Retry-After")
+                try:
+                    if ra is not None:
+                        last_retry_after = int(float(ra))
+                except Exception:
+                    # ignore parse errors
+                    last_retry_after = None
+                raise requests.exceptions.HTTPError(f"429")
             resp.raise_for_status()
-            return resp
-        except requests.exceptions.RequestException as e:
-            # Last attempt -> re-raise
-            if attempt >= max_attempts:
+            return resp, None
+        except requests.exceptions.HTTPError as he:
+            if "429" in str(he):
+                # bubble up a retry-after hint
+                return None, last_retry_after or int(backoff)
+            if attempt == attempts:
                 raise
-            # Sleep then retry
-            time.sleep(backoff)
-            backoff *= 2
-    raise RuntimeError("Failed after retries")
+        except Exception:
+            if attempt == attempts:
+                raise
+        time.sleep(backoff)
+        backoff *= 2
+    raise RuntimeError("Unreachable")
 
-# Primary fetch: Yahoo (cached)
-def fetch_xau_usd_cached():
-    cached = cache_get("xau_usd")
-    if cached is not None:
-        return cached, "Yahoo (cached)"
+# Primary fetchers
+def fetch_xau_yahoo():
     url = "https://query1.finance.yahoo.com/v7/finance/quote"
     params = {"symbols": "XAUUSD=X"}
-    try:
-        resp = http_get_with_retries(url, params=params, max_attempts=3)
-        j = resp.json()
-        price = j["quoteResponse"]["result"][0]["regularMarketPrice"]
-        cache_set("xau_usd", float(price))
-        return float(price), "Yahoo"
-    except Exception as e:
-        # Propagate message to caller
-        raise
+    resp, retry_after = http_get(url, params=params, attempts=2)
+    if resp is None:
+        # return None and retry_after hint
+        return None, None, retry_after
+    j = resp.json()
+    price = j["quoteResponse"]["result"][0]["regularMarketPrice"]
+    return float(price), "Yahoo Finance", None
 
-# USD→INR fetch (cached)
-def fetch_usd_inr_cached():
-    cached = cache_get("usd_inr")
-    if cached is not None:
-        return cached, "exchangerate.host (cached)"
+def fetch_usd_inr():
     url = "https://api.exchangerate.host/latest"
     params = {"base": "USD", "symbols": "INR"}
-    try:
-        resp = http_get_with_retries(url, params=params, max_attempts=3)
-        rate = resp.json()["rates"]["INR"]
-        cache_set("usd_inr", float(rate))
-        return float(rate), "exchangerate.host"
-    except Exception as e:
-        raise
+    resp, retry_after = http_get(url, params=params, attempts=2)
+    if resp is None:
+        return None, None, retry_after
+    j = resp.json()
+    rate = j["rates"]["INR"]
+    return float(rate), "exchangerate.host", None
 
-# Optional fallback: Metals-API (if user provided key)
-def fetch_xau_metalsapi(key):
-    # metals-api.com example endpoint (user must provide key). Adjust path if provider differs.
+def fetch_metals_api(key):
     url = "https://metals-api.com/api/latest"
     params = {"access_key": key, "base": "USD", "symbols": "XAU"}
-    resp = requests.get(url, params=params, timeout=10)
-    resp.raise_for_status()
+    resp, retry_after = http_get(url, params=params, attempts=2)
+    if resp is None:
+        return None, None, retry_after
     j = resp.json()
-    # Different APIs return different shapes — try to be flexible
-    # metals-api returns rates like {"rates": {"XAU": 0.00056}} meaning XAU per USD — convert if necessary
-    rates = j.get("rates")
-    if rates and "XAU" in rates:
-        # if rate is XAU per USD, then USD per XAU = 1/rate
+    rates = j.get("rates") or {}
+    if "XAU" in rates:
         r = rates["XAU"]
-        if r == 0:
-            raise RuntimeError("Metals API returned XAU=0")
-        usd_per_xau = 1.0 / float(r)
-        cache_set("xau_usd", usd_per_xau)
-        return usd_per_xau, "Metals-API"
-    raise RuntimeError("Metals API response missing XAU")
+        usd_per_xau = 1.0 / float(r) if float(r) != 0 else None
+        return usd_per_xau, "Metals-API", None
+    raise RuntimeError("Metals-API returned unexpected shape")
 
-# Conversion & display
-def convert_and_display(xau_usd, usd_inr, source_xau, source_fx):
+# Main logic: show cached always (if exists)
+cached = cache_get()
+if cached:
+    age = cache_age_seconds()
+    st.info(f"Showing cached price (age {int(age)}s). Increase Cache TTL in sidebar to keep it longer.")
+    st.write(f"XAU source: **{cached.get('source_xau')}**  |  USD→INR source: **{cached.get('source_fx')}**")
+    st.write(f"XAU (USD/oz): {cached.get('xau_usd')}")
+    st.write(f"USD → INR: {cached.get('usd_inr')}")
+    # show computed rates
+    xau_usd = cached.get('xau_usd')
+    usd_inr = cached.get('usd_inr')
     usd_per_gram = xau_usd / GRAMS_PER_TROY_OUNCE
     usd_per_10g = usd_per_gram * 10
     inr_per_10g = usd_per_10g * usd_inr
+    def show_rates(inr_10g):
+        st.subheader("Final Gold Rates per 10g")
+        for purity, factor in [("24K", 1.0), ("22K", 22/24), ("18K", 18/24)]:
+            base = inr_10g * factor
+            after_imp = base * (1 + import_duty_pct/100)
+            after_gst = after_imp * (1 + gst_pct/100)
+            st.write(f"**{purity}** — Base: ₹ {round_value(base):,}  | After import: ₹ {round_value(after_imp):,}  | Final: ₹ {round_value(after_gst):,}")
+    show_rates(inr_per_10g)
+else:
+    st.warning("No cached rate available yet. Press Refresh to fetch live rate (respecting cooldown).")
 
-    st.write(f"Source XAU: **{source_xau}** — XAU/USD: {xau_usd}")
-    st.write(f"Source FX: **{source_fx}** — USD→INR: {usd_inr}")
+# Determine if user can fetch (UI cooldown)
+if st.session_state.last_user_fetch is None:
+    allowed = True
+else:
+    elapsed = (datetime.utcnow() - st.session_state.last_user_fetch).total_seconds()
+    allowed = elapsed >= ui_cooldown
+    if not allowed:
+        st.write(f"UI cooldown active — wait {int(ui_cooldown - elapsed)}s before forcing another fetch.")
 
-    rates = {
-        "24K": inr_per_10g,
-        "22K": inr_per_10g * (22 / 24),
-        "18K": inr_per_10g * (18 / 24),
-    }
-
-    st.subheader("Final rates per 10 g")
-    for purity, base in rates.items():
-        after_imp = base * (1 + import_duty_pct / 100)
-        after_gst = after_imp * (1 + gst_pct / 100)
-        st.write(f"**{purity}**")
-        st.write(f"- Base: ₹ {round_value(base):,}")
-        st.write(f"- After import duty: ₹ {round_value(after_imp):,}")
-        st.write(f"- Final (after GST): ₹ {round_value(after_gst):,}")
-        st.write("---")
-
-# Main flow
-allowed, wait = can_fetch()
-if fetch_btn and not allowed:
-    st.warning(f"Please wait {wait} second(s) before fetching again (UI cooldown).")
-if fetch_btn and allowed:
-    st.session_state.last_fetch_time = datetime.utcnow()
-    # Try primary path (Yahoo + exchangerate.host)
-    try:
-        xau_usd, source_xau = fetch_xau_usd_cached()
-        usd_inr, source_fx = fetch_usd_inr_cached()
-        st.success("Fetched live rates.")
-        convert_and_display(xau_usd, usd_inr, source_xau, source_fx)
-    except Exception as e_primary:
-        # If primary fails due to 429 or other, inform user and try optional fallback
-        err_msg = str(e_primary)
-        st.error(f"Primary source error: {err_msg}")
-        # If it's a 429 with retry hint, show helpful message
-        if "429" in err_msg:
-            st.info("The remote service is throttling requests. Please wait a bit or increase Cache TTL in sidebar.")
-            # If Retry-After present in exception message we already surfaced it earlier.
-        # Try fallback (Metals-API) if key provided
-        if metals_api_key:
+# If user pressed refresh and allowed, attempt fetch sequence
+if refresh:
+    if not allowed:
+        st.warning("Please wait for cooldown before forcing another fetch.")
+    else:
+        st.session_state.last_user_fetch = datetime.utcnow()
+        # attempt primary
+        with st.spinner("Fetching XAU and FX (Yahoo + exchangerate.host)..."):
             try:
-                xau_usd, fx = fetch_xau_metalsapi(metals_api_key)
-                usd_inr, source_fx = fetch_usd_inr_cached()
-                st.success("Fetched using Metals-API fallback.")
-                convert_and_display(xau_usd, usd_inr, fx, source_fx)
-            except Exception as e_fallback:
-                st.error(f"Fallback also failed: {e_fallback}")
-                st.write("You can add a valid Metals-API key in the sidebar or increase cache TTL / cooldown to avoid 429s.")
-        else:
-            st.write("No fallback API key configured. Add a Metals-API key in the sidebar or increase Cache TTL to avoid rate-limits.")
+                xau_res = fetch_xau_yahoo()
+                if xau_res[0] is None:
+                    # got a retry-after
+                    _, _, retry_after = xau_res
+                    st.session_state.last_retry_after = retry_after
+                    st.error(f"Primary source error: 429. Retry after {retry_after}s. Using cached if available.")
+                else:
+                    xau_usd, src_xau, _ = xau_res
+                    fx_res = fetch_usd_inr()
+                    if fx_res[0] is None:
+                        _, _, retry_after = fx_res
+                        st.session_state.last_retry_after = retry_after
+                        st.error(f"Primary FX source error: 429. Retry after {retry_after}s. Using cached if available.")
+                    else:
+                        usd_inr, src_fx, _ = fx_res
+                        # success — cache and show
+                        cache_set(xau_usd=xau_usd, usd_inr=usd_inr, source_xau=src_xau, source_fx=src_fx)
+                        st.success("Fetched live prices and updated cache.")
+                        st.experimental_rerun()
+            except Exception as e:
+                st.error(f"Primary fetch failed: {e}")
+                # try fallback if key present
+                if metals_api_key:
+                    with st.spinner("Trying Metals-API fallback..."):
+                        try:
+                            met = fetch_metals_api(metals_api_key)
+                            if met[0] is None:
+                                _, _, retry_after = met
+                                st.error(f"Fallback 429. Retry after {retry_after}s")
+                            else:
+                                xau_usd, src = met[0], met[1]
+                                fx_res = fetch_usd_inr()
+                                if fx_res[0] is None:
+                                    st.error("FX fetch failed when fallback used.")
+                                else:
+                                    usd_inr, src_fx, _ = fx_res
+                                    cache_set(xau_usd=xau_usd, usd_inr=usd_inr, source_xau=src, source_fx=src_fx)
+                                    st.success("Fallback succeeded and cache updated.")
+                                    st.experimental_rerun()
+                        except Exception as ef:
+                            st.error(f"Fallback attempt failed: {ef}")
+                else:
+                    st.info("No Metals-API key configured. Add one in the sidebar to enable a paid fallback.")
+
+# show helpful tips
+st.markdown("---")
+st.subheader("Why you're seeing 429 / how to stop it")
+st.write(
+    "- 429 = remote service (Yahoo) is rate-limiting the IP used by Streamlit Cloud.\n"
+    "- Increase **Cache TTL** (sidebar) to 60–300s to avoid frequent hits.\n"
+    "- Don't press Refresh repeatedly — use the cache and the cooldown.\n"
+    "- For production, use a paid provider (Metals-API / GoldAPI) behind an API key or a backend with pooled requests."
+)
