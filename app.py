@@ -1,49 +1,81 @@
-import streamlit as st
-import requests
+from flask import Flask, jsonify, render_template, request
+import requests, re
+from functools import lru_cache
+import time
 
-st.set_page_config(page_title="Live Gold Rate Calculator (India)", page_icon="🏅", layout="centered")
+app = Flask(__name__)
+HEADERS = {"User-Agent":"goldcalc/1.0"}
 
-def fetch_live_data():
-    try:
-        xau_data = requests.get("https://api.metals.live/v1/spot").json()[0]
-        xau_usd = xau_data.get("gold", 0)
-        usd_inr = requests.get("https://api.exchangerate.host/latest?base=USD&symbols=INR").json()["rates"]["INR"]
-        return xau_usd, usd_inr
-    except Exception:
-        st.warning("⚠️ Could not fetch live data. Please enter values manually.")
-        return None, None
+XAU_URL = "https://in.investing.com/currencies/xau-usd"
+USD_URL = "https://in.investing.com/currencies/usd-inr"
 
-def gold_rate_from_xauusd(xau_usd, usd_inr, duty_gst_rate):
-    usd_per_gram = xau_usd / 31.1035
-    inr_per_gram_24k = usd_per_gram * usd_inr
-    inr_per_gram_22k = inr_per_gram_24k * 0.9167
-    retail_22k = inr_per_gram_22k * (1 + duty_gst_rate / 100)
+def extract_price(html: str):
+    m = re.search(r'data-last=["\']?([0-9,]+\.\d+)["\']?', html)
+    if m:
+        return float(m.group(1).replace(",",""))
+    m = re.search(r'id=["\']last_last["\'][^>]*>([0-9,]+\.\d+)<', html)
+    if m:
+        return float(m.group(1).replace(",",""))
+    m = re.search(r'([0-9]{1,3}(?:,[0-9]{3})*\.\d{1,6})', html)
+    if m:
+        return float(m.group(1).replace(",",""))
+    return None
 
-    return {
-        "24K per gram (₹)": round(inr_per_gram_24k, 2),
-        "24K per 10g (₹)": round(inr_per_gram_24k * 10, 2),
-        "22K per gram (₹)": round(retail_22k, 2),
-        "22K per 10g (₹)": round(retail_22k * 10, 2),
+@lru_cache(maxsize=64)
+def cached_fetch(url):
+    r = requests.get(url, headers=HEADERS, timeout=15)
+    r.raise_for_status()
+    return r.text
+
+@app.route("/api/rate")
+def api_rate():
+    # query params to override defaults
+    import_duty = float(request.args.get("import_duty", 6.0))
+    gst = float(request.args.get("gst", 3.0))
+    mcx_adjust = float(request.args.get("mcx_adjust", 0.0))
+
+    # fetch (cached)
+    xau_html = cached_fetch(XAU_URL)
+    usd_html = cached_fetch(USD_URL)
+
+    xau = extract_price(xau_html)
+    usd = extract_price(usd_html)
+    if xau is None or usd is None:
+        return jsonify({"error":"failed to parse source pages"}), 500
+
+    ounce_to_gram = 31.1034768
+    price_per_gram_usd = xau / ounce_to_gram
+    price_per_gram_inr = price_per_gram_usd * usd
+    per_10g = price_per_gram_inr * 10.0
+
+    customs = per_10g * (import_duty/100.0)
+    assessable = per_10g + customs
+    gst_amount = assessable * (gst/100.0)
+    final_imported_24 = per_10g + customs + gst_amount
+
+    def round2(x): return round(x,2)
+    result = {
+        "source": {"xau_usd": xau, "usd_inr": usd},
+        "raw": {
+            "24k_per_10g": round2(per_10g),
+            "22k_per_10g": round2(per_10g * 22/24),
+            "18k_per_10g": round2(per_10g * 18/24),
+        },
+        "imported": {
+            "24k_per_10g": round2(final_imported_24),
+            "22k_per_10g": round2(final_imported_24 * 22/24),
+            "18k_per_10g": round2(final_imported_24 * 18/24)
+        },
+        "mcx_adjust": mcx_adjust,
+        "mcx": {
+            "24k": round2(final_imported_24 + mcx_adjust),
+            "22k": round2(final_imported_24 * 22/24 + mcx_adjust),
+            "18k": round2(final_imported_24 * 18/24 + mcx_adjust)
+        },
+        "meta": {"import_duty_pct": import_duty, "gst_pct": gst, "timestamp": int(time.time())}
     }
+    return jsonify(result)
 
-st.title("🏅 Live Gold Rate Calculator (India)")
-
-if st.button("Fetch Live Prices"):
-    xau_usd, usd_inr = fetch_live_data()
-    if xau_usd and usd_inr:
-        st.success(f"Live XAU/USD: {xau_usd} | USD/INR: {usd_inr}")
-else:
-    xau_usd = st.number_input("Enter XAU/USD (Gold price per ounce in USD):", value=4013.0)
-    usd_inr = st.number_input("Enter USD/INR exchange rate:", value=88.3)
-
-duty_gst_rate = st.number_input("Enter import duty + GST rate (%) (default 18):", value=18.0)
-
-if st.button("Calculate Gold Rate"):
-    rates = gold_rate_from_xauusd(xau_usd, usd_inr, duty_gst_rate)
-    st.subheader("Results:")
-    st.write(f"**24K per gram:** ₹{rates['24K per gram (₹)']}")
-    st.write(f"**24K per 10g:** ₹{rates['24K per 10g (₹)']}")
-    st.write(f"**22K per gram (with duty + GST):** ₹{rates['22K per gram (₹)']}")
-    st.write(f"**22K per 10g (with duty + GST):** ₹{rates['22K per 10g (₹)']}")
-
-st.caption("💡 Data source: metals.live (XAU/USD) and exchangerate.host (USD/INR). Prices are indicative — retail rates vary by city.")
+@app.route("/")
+def index():
+    return render_template("index.html")
